@@ -23,9 +23,7 @@ bathymetry/
 ## Requirements
 
 ```bash
-pip install rasterio numpy requests matplotlib cmocean
-# For tile generation:
-conda install -c conda-forge gdal   # provides gdal2tiles
+conda install -c conda-forge rasterio numpy requests matplotlib cmocean
 ```
 
 ## Usage

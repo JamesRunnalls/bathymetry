@@ -979,7 +979,7 @@ def run_pipeline(
     cmap_max: float = 1.0,
     depth_range: tuple[float, float] | None = None,
     dst_crs: CRS = DST_CRS,
-    legend: bool = True,
+    legend: bool = False,
     terrain_rgb: bool = False,
     cache_path: str | None = None,
 ) -> str:
@@ -1087,7 +1087,7 @@ Examples:
     parser.add_argument("--colormap-range", type=float, nargs=2, default=[0.0, 1.0],
                         metavar=("MIN", "MAX"),
                         help="Subset of colormap to use, e.g. --colormap-range 0.25 1.0 skips the first 25%%")
-    parser.add_argument("--no-legend", action="store_true", help="Skip legend generation")
+    parser.add_argument("--legend", action="store_true", help="Generate a colorbar legend PNG alongside the GeoTIFF")
     parser.add_argument(
         "--terrain-rgb",
         action="store_true",
@@ -1163,7 +1163,7 @@ Examples:
             cmap_min=args.colormap_range[0],
             cmap_max=args.colormap_range[1],
             dst_crs=dst_crs,
-            legend=not args.no_legend,
+            legend=args.legend,
             terrain_rgb=args.terrain_rgb,
         )
 
@@ -1189,7 +1189,7 @@ Examples:
             cmap_min=args.colormap_range[0],
             cmap_max=args.colormap_range[1],
             dst_crs=dst_crs,
-            legend=not args.no_legend,
+            legend=args.legend,
             terrain_rgb=args.terrain_rgb,
         )
     elif args.input_dir:
@@ -1215,7 +1215,7 @@ Examples:
             cmap_min=args.colormap_range[0],
             cmap_max=args.colormap_range[1],
             dst_crs=dst_crs,
-            legend=not args.no_legend,
+            legend=args.legend,
             terrain_rgb=args.terrain_rgb,
         )
     elif args.lake:
