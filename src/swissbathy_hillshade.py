@@ -27,6 +27,8 @@ import io
 import json
 import logging
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import zipfile
@@ -275,50 +277,125 @@ def load_and_mosaic(asc_files: list[str], nodata: float = -9999.0) -> tuple[np.n
     return elevation, mosaic_transform, SRC_CRS
 
 
+def mosaic_to_file(
+    asc_files: list[str],
+    cache_path: str,
+    nodata: float = -9999.0,
+) -> tuple[str, rasterio.Affine, CRS]:
+    """
+    Merge .asc tiles into a tiled GeoTIFF without loading the full mosaic into
+    RAM.  Uses ``gdalbuildvrt`` when available (streams tile-by-tile via GDAL's
+    virtual dataset), otherwise falls back to a pure-rasterio tile-by-tile
+    streaming write.
+
+    Returns (cache_path, transform, crs) — the elevation array is NOT loaded.
+    """
+    Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
+
+    if shutil.which("gdalbuildvrt"):
+        # ── GDAL VRT path (preferred) ──────────────────────────────────────
+        vrt_fd, vrt_path = tempfile.mkstemp(suffix=".vrt")
+        os.close(vrt_fd)
+        try:
+            subprocess.run(
+                ["gdalbuildvrt", "-a_srs", "EPSG:2056",
+                 "-srcnodata", str(nodata), vrt_path] + list(asc_files),
+                check=True, capture_output=True,
+            )
+            with rasterio.open(vrt_path) as src:
+                transform = src.transform
+                profile = {
+                    "driver": "GTiff", "dtype": "float32",
+                    "width": src.width, "height": src.height,
+                    "count": 1, "crs": SRC_CRS, "transform": transform,
+                    "compress": "lzw", "tiled": True,
+                    "blockxsize": 512, "blockysize": 512,
+                    "nodata": float("nan"),
+                }
+                log.info(f"Streaming mosaic ({src.width}×{src.height}) → {cache_path}")
+                with rasterio.open(cache_path, "w", **profile) as dst:
+                    for _, window in src.block_windows(1):
+                        data = src.read(1, window=window).astype(np.float32)
+                        data[data == nodata] = np.nan
+                        data[data < -9000] = np.nan
+                        dst.write(data, 1, window=window)
+        finally:
+            os.unlink(vrt_path)
+    else:
+        # ── Pure-rasterio streaming fallback ───────────────────────────────
+        datasets = []
+        for f in asc_files:
+            ds = rasterio.open(f)
+            if ds.crs is None:
+                ds.close()
+                ds = rasterio.open(f, crs=SRC_CRS)
+            datasets.append(ds)
+        if not datasets:
+            raise ValueError("No .asc files to mosaic")
+
+        from rasterio.transform import from_origin
+        from rasterio.windows import from_bounds as win_from_bounds
+
+        res = datasets[0].res  # (row_res, col_res)
+        left   = min(ds.bounds.left   for ds in datasets)
+        right  = max(ds.bounds.right  for ds in datasets)
+        bottom = min(ds.bounds.bottom for ds in datasets)
+        top    = max(ds.bounds.top    for ds in datasets)
+        transform = from_origin(left, top, res[1], res[0])
+        width  = max(1, int(round((right - left)  / res[1])))
+        height = max(1, int(round((top   - bottom) / res[0])))
+
+        profile = {
+            "driver": "GTiff", "dtype": "float32",
+            "width": width, "height": height, "count": 1,
+            "crs": SRC_CRS, "transform": transform,
+            "compress": "lzw", "tiled": True,
+            "blockxsize": 512, "blockysize": 512,
+            "nodata": float("nan"),
+        }
+        log.info(f"Streaming mosaic ({width}×{height}) → {cache_path}")
+        with rasterio.open(cache_path, "w", **profile) as dst:
+            for i, ds in enumerate(datasets):
+                log.info(f"  tile {i+1}/{len(datasets)}: {Path(asc_files[i]).name}")
+                data = ds.read(1).astype(np.float32)
+                data[data == nodata] = np.nan
+                data[data < -9000] = np.nan
+                win = win_from_bounds(
+                    ds.bounds.left, ds.bounds.bottom,
+                    ds.bounds.right, ds.bounds.top,
+                    transform=transform,
+                ).round_offsets().round_lengths()
+                dst.write(data, 1, window=win)
+        for ds in datasets:
+            ds.close()
+
+    with rasterio.open(cache_path) as ds:
+        transform = ds.transform
+    log.info(f"Mosaic written: {cache_path}")
+    return cache_path, transform, SRC_CRS
+
+
 def load_or_mosaic_cached(
     asc_files: list[str],
     cache_path: str,
     nodata: float = -9999.0,
-) -> tuple[np.ndarray, rasterio.Affine, CRS]:
+) -> tuple[str, rasterio.Affine, CRS]:
     """
-    Load a cached mosaic GeoTIFF if it is up-to-date, otherwise mosaic the
-    source .asc files and write the result to cache_path for future runs.
+    Return a path to a cached mosaic GeoTIFF, building it first if stale or
+    absent.  The elevation data is NOT loaded into RAM — callers should read
+    the file with windowed I/O.
 
-    The cache is considered valid when cache_path exists and its modification
-    time is >= the newest source .asc file.  Skipping ASCII parsing on reruns
-    gives a significant speed-up for large lakes with many tiles.
+    The cache is valid when it exists and is newer than all source .asc files.
     """
     cache = Path(cache_path)
-
     if asc_files and cache.exists():
         newest_src = max(os.path.getmtime(f) for f in asc_files)
         if cache.stat().st_mtime >= newest_src:
-            log.info(f"Loading cached mosaic: {cache_path}")
+            log.info(f"Using cached mosaic: {cache_path}")
             with rasterio.open(cache_path) as ds:
-                elevation = ds.read(1).astype(np.float32)
-                transform = ds.transform
-            return elevation, transform, SRC_CRS
+                return cache_path, ds.transform, SRC_CRS
 
-    elevation, transform, crs = load_and_mosaic(asc_files, nodata)
-
-    cache.parent.mkdir(parents=True, exist_ok=True)
-    h, w = elevation.shape
-    profile = {
-        "driver": "GTiff",
-        "dtype": "float32",
-        "width": w,
-        "height": h,
-        "count": 1,
-        "crs": SRC_CRS,
-        "transform": transform,
-        "compress": "lzw",
-        "nodata": float("nan"),
-    }
-    with rasterio.open(cache_path, "w", **profile) as ds:
-        ds.write(elevation, 1)
-    log.info(f"Saved mosaic cache: {cache_path}")
-
-    return elevation, transform, crs
+    return mosaic_to_file(asc_files, cache_path, nodata)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -667,7 +744,57 @@ def write_geotiff(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 6b. Terrain-RGB encoding
+# 6b. Streaming warp (file → file, no full-array in RAM)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_CHUNK_ROWS = 4096   # rows per processing chunk
+_HS_OVERLAP = 1      # 1-pixel border needed for Horn's hillshade gradient
+
+
+def _write_geotiff_from_file(
+    src_path: str,
+    output_path: str,
+    dst_crs: CRS = DST_CRS,
+    resampling: WarpResampling = WarpResampling.bilinear,
+    nearest: bool = False,
+) -> str:
+    """
+    Reproject a source GeoTIFF to dst_crs using a WarpedVRT so the full raster
+    is never loaded into RAM — reads and writes in native blocks.
+    """
+    from rasterio.vrt import WarpedVRT
+
+    _resampling = WarpResampling.nearest if nearest else resampling
+    with rasterio.open(src_path) as src:
+        with WarpedVRT(src, crs=dst_crs, resampling=_resampling) as vrt:
+            profile = vrt.profile.copy()
+            profile.update(
+                compress="lzw", tiled=True,
+                blockxsize=256, blockysize=256,
+            )
+            log.info(f"Streaming warp {src.crs} → {dst_crs}: "
+                     f"{src.width}×{src.height} → {vrt.width}×{vrt.height}")
+            with rasterio.open(output_path, "w", **profile) as dst:
+                for _, window in vrt.block_windows(1):
+                    dst.write(vrt.read(window=window), window=window)
+
+    with rasterio.open(output_path, "r+") as dst:
+        dst.colorinterp = (
+            rasterio.enums.ColorInterp.red,
+            rasterio.enums.ColorInterp.green,
+            rasterio.enums.ColorInterp.blue,
+            rasterio.enums.ColorInterp.alpha,
+        )
+        dst.build_overviews([2, 4, 8, 16], Resampling.average)
+        dst.update_tags(ns="rio_overview", resampling="average")
+
+    file_size = os.path.getsize(output_path) / (1024 * 1024)
+    log.info(f"Written: {output_path} ({file_size:.1f} MB)")
+    return output_path
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6c. Terrain-RGB encoding
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -958,8 +1085,155 @@ def generate_demo_data(output_dir: str) -> list[str]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Main pipeline
+# Main pipeline — chunked (large lakes) and in-memory (small/demo)
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+def _run_pipeline_chunked(
+    mosaic_path: str,
+    output_path: str,
+    lake_surface_level: float,
+    lake_name: str = "",
+    azimuth: float = 315.0,
+    altitude: float = 45.0,
+    z_factor: float = 3.0,
+    multidirectional: bool = False,
+    blend_mode: str = "multiply",
+    hillshade_strength: float = 0.8,
+    shadow_exponent: float = 2.0,
+    colormap_name: str = "auto",
+    cmap_min: float = 0.0,
+    cmap_max: float = 1.0,
+    depth_range: tuple[float, float] | None = None,
+    dst_crs: CRS = DST_CRS,
+    legend: bool = False,
+    terrain_rgb: bool = False,
+) -> str:
+    """
+    Memory-efficient pipeline that reads the mosaic in overlapping row-chunks
+    so the full elevation array is never in RAM.
+
+    Flow:
+      Pass 0 (optional): scan depth range block-by-block.
+      Pass 1: for each row-chunk, read elevation (+ 1px overlap), compute
+              hillshade, colorize, composite, write RGBA chunk to a temp
+              GeoTIFF in the source CRS.
+      Pass 2: stream-warp the temp GeoTIFF to dst_crs via WarpedVRT.
+    """
+    cmap = make_depth_colormap(colormap_name, cmap_min=cmap_min, cmap_max=cmap_max)
+
+    with rasterio.open(mosaic_path) as src:
+        transform = src.transform
+        src_crs   = src.crs or SRC_CRS
+        height    = src.height
+        width     = src.width
+
+    # ── Pass 0: determine depth range if not provided ─────────────────────
+    if depth_range is None:
+        log.info("Scanning depth range...")
+        dmin = np.inf
+        with rasterio.open(mosaic_path) as src:
+            for _, window in src.block_windows(1):
+                data = src.read(1, window=window)
+                valid = data[~np.isnan(data)]
+                if valid.size:
+                    dmin = min(dmin, float(valid.min()) - lake_surface_level)
+        depth_range = (float(dmin), 0.0)
+        log.info(f"Depth range: {abs(dmin):.1f} m max depth")
+
+    # ── Terrain-RGB (chunked) ─────────────────────────────────────────────
+    if terrain_rgb:
+        log.info("Writing Terrain-RGB (chunked)...")
+        terrain_rgb_path = output_path.replace("_hillshade_4326", "_terrain_rgb_4326")
+        if terrain_rgb_path == output_path:
+            base, ext = os.path.splitext(output_path)
+            terrain_rgb_path = base + "_terrain_rgb" + (ext or ".tif")
+        tmp_trgb = output_path + ".terrain_tmp.tif"
+        try:
+            profile_trgb = {
+                "driver": "GTiff", "dtype": "uint8", "count": 4,
+                "width": width, "height": height,
+                "crs": src_crs, "transform": transform,
+                "compress": "lzw", "tiled": True,
+                "blockxsize": 256, "blockysize": 256,
+            }
+            with rasterio.open(mosaic_path) as src, \
+                 rasterio.open(tmp_trgb, "w", **profile_trgb) as dst:
+                for _, window in src.block_windows(1):
+                    elev = src.read(1, window=window).astype(np.float32)
+                    depth = np.where(np.isnan(elev), np.nan, lake_surface_level - elev)
+                    R, G, B, alpha = encode_terrain_rgb(depth)
+                    dst.write(np.stack([R, G, B, alpha]), window=window)
+            _write_geotiff_from_file(tmp_trgb, terrain_rgb_path,
+                                     dst_crs=dst_crs, nearest=True)
+        finally:
+            if os.path.exists(tmp_trgb):
+                os.unlink(tmp_trgb)
+
+    # ── Pass 1: hillshade + colorize + composite, row-chunk by row-chunk ──
+    log.info(f"Processing in {_CHUNK_ROWS}-row chunks...")
+    tmp_rgba = output_path + ".rgba_tmp.tif"
+    profile_rgba = {
+        "driver": "GTiff", "dtype": "uint8", "count": 4,
+        "width": width, "height": height,
+        "crs": src_crs, "transform": transform,
+        "compress": "lzw", "tiled": True,
+        "blockxsize": 256, "blockysize": 256,
+    }
+    try:
+        n_chunks = (height + _CHUNK_ROWS - 1) // _CHUNK_ROWS
+        with rasterio.open(mosaic_path) as src, \
+             rasterio.open(tmp_rgba, "w", **profile_rgba) as dst:
+            for idx in range(n_chunks):
+                r0 = idx * _CHUNK_ROWS
+                r1 = min(r0 + _CHUNK_ROWS, height)
+                log.info(f"  Chunk {idx+1}/{n_chunks} (rows {r0}–{r1})")
+
+                # Read with 1-pixel overlap so Horn gradients are correct at borders
+                r0r = max(0, r0 - _HS_OVERLAP)
+                r1r = min(height, r1 + _HS_OVERLAP)
+                elev_pad = src.read(
+                    1, window=rasterio.windows.Window(0, r0r, width, r1r - r0r)
+                ).astype(np.float32)
+
+                hs_pad = compute_hillshade(
+                    elev_pad, transform,
+                    azimuth=azimuth, altitude=altitude,
+                    z_factor=z_factor, multidirectional=multidirectional,
+                    shadow_exponent=shadow_exponent,
+                )
+
+                # Trim the overlap border back off
+                t = r0 - r0r
+                b = (r1r - r0r) - (r1 - r0) - t
+                elev_chunk = elev_pad[t: (r1r - r0r) - b if b else None]
+                hs_chunk   = hs_pad  [t: (r1r - r0r) - b if b else None]
+
+                rgba       = colorize_depth(elev_chunk, lake_surface_level,
+                                            cmap=cmap, depth_range=depth_range)
+                composited = composite_hillshade_color(
+                    rgba, hs_chunk,
+                    blend_mode=blend_mode, hillshade_strength=hillshade_strength,
+                )
+                dst.write(
+                    np.moveaxis(composited, -1, 0),
+                    window=rasterio.windows.Window(0, r0, width, r1 - r0),
+                )
+
+        # ── Pass 2: streaming warp to dst_crs ─────────────────────────────
+        log.info("Reprojecting (streaming warp)...")
+        _write_geotiff_from_file(tmp_rgba, output_path, dst_crs=dst_crs)
+    finally:
+        if os.path.exists(tmp_rgba):
+            os.unlink(tmp_rgba)
+
+    if legend:
+        legend_path = output_path.replace(".tif", "_legend.png").replace(".tiff", "_legend.png")
+        dmin, _ = depth_range
+        generate_legend(cmap, 0, abs(dmin), legend_path, lake_name=lake_name)
+
+    log.info(f"\n── Done! Output: {output_path} ──")
+    return output_path
 
 
 def run_pipeline(
@@ -989,12 +1263,29 @@ def run_pipeline(
     log.info("swissBATHY3D Hillshade + Depth Color Pipeline")
     log.info("=" * 60)
 
-    # Step 1: Mosaic (or load from cache)
-    log.info("\n── Step 1: Loading and mosaicking tiles ──")
+    # When a cache path is provided (all lake downloads), use the chunked path:
+    # mosaic tiles → disk, process in row-chunks, stream-warp to output.
+    # This keeps peak RAM to one chunk (~4096 rows) regardless of lake size.
     if cache_path:
-        elevation, transform, crs = load_or_mosaic_cached(asc_files, cache_path)
-    else:
-        elevation, transform, crs = load_and_mosaic(asc_files)
+        log.info("\n── Step 1: Building / validating mosaic cache ──")
+        mosaic_path, _, _ = load_or_mosaic_cached(asc_files, cache_path)
+        return _run_pipeline_chunked(
+            mosaic_path=mosaic_path,
+            output_path=output_path,
+            lake_surface_level=lake_surface_level,
+            lake_name=lake_name,
+            azimuth=azimuth, altitude=altitude,
+            z_factor=z_factor, multidirectional=multidirectional,
+            blend_mode=blend_mode, hillshade_strength=hillshade_strength,
+            shadow_exponent=shadow_exponent,
+            colormap_name=colormap_name, cmap_min=cmap_min, cmap_max=cmap_max,
+            depth_range=depth_range, dst_crs=dst_crs,
+            legend=legend, terrain_rgb=terrain_rgb,
+        )
+
+    # ── In-memory path (--demo / --input-dir, typically small) ───────────
+    log.info("\n── Step 1: Loading and mosaicking tiles ──")
+    elevation, transform, crs = load_and_mosaic(asc_files)
 
     # Step 1b: Terrain-RGB (optional — uses raw elevation before any visualisation)
     if terrain_rgb:
