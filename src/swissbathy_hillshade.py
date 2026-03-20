@@ -84,17 +84,16 @@ TERRAIN_RGB_MAX_VAL = 16_777_215  # 2^24 - 1 (max 3-byte value)
 # Keys match the STAC item ID slugs (swissbathy3d_<slug>).
 # These are used to compute depth = surface_level - elevation.
 LAKE_SURFACE_LEVELS = {
-    "aegerisee":          724.0,
-    "baldeggersee":       463.0,
-    "bielersee":          429.1,
-    "bodensee":           395.6,
-    "brienzersee":        563.7,
-    "hallwilersee":       449.3,
-    "lacdejoux":         1004.0,
-    "lacleman":           372.0,
+    #"aegerisee":          724.0,
+   # "baldeggersee":       463.0,
+    #"bielersee":          429.1,
+    #"bodensee":           395.6,
+    #"brienzersee":        563.7,
+   # "hallwilersee":       449.3,
+   # "lacdejoux":         1004.0,
+   # "lacleman":           372.0,
     "lacneuchatel":       429.4,
     "lagomaggiore":       193.5,
-    "lungernsee":         688.0,
     "murtensee":          429.3,
     "sarnersee":          468.4,
     "sempachersee":       504.0,
@@ -896,6 +895,20 @@ def apply_lake_mask(output_path: str, geojson_path: str, lake_key: str) -> None:
     log.info(f"Lake mask applied ({lake_key}): pixels outside polygon are now transparent")
 
 
+def _get_map_name(geojson_path: str, lake_key: str) -> str:
+    """Return the 'map' property for *lake_key* from *geojson_path*, or *lake_key* if not found."""
+    try:
+        with open(geojson_path) as f:
+            gj = json.load(f)
+        for feat in gj.get("features", []):
+            props = feat.get("properties", {})
+            if props.get("key") == lake_key:
+                return props.get("map") or lake_key
+    except Exception:
+        pass
+    return lake_key
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 8. Legend generation
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1227,7 +1240,8 @@ Examples:
             return
         dl_dir = str(_DATA_TILES_DIR / f"swissbathy_tiles_{lake_slug}")
         asc_files = download_tiles(tile_urls, dl_dir)
-        out = args.output if args.output else str(_DATA_OUTPUT_DIR / f"{lake_slug}_hillshade_4326.tif")
+        map_name = _get_map_name(args.mask_geojson, lake_slug)
+        out = args.output if args.output else str(_DATA_OUTPUT_DIR / f"{map_name}_hillshade_4326.tif")
         cache_path = str(_DATA_TILES_DIR / f"{lake_slug}_mosaic.tif")
         run_pipeline(
             asc_files=asc_files,
@@ -1282,8 +1296,8 @@ Examples:
         if not asc_files:
             parser.error(f"No .asc/.grd files found in {args.input_dir}")
         log.info(f"Found {len(asc_files)} tiles in {args.input_dir}")
-        safe_name = lake_name.lower().replace(" ", "_") if lake_name else "swissbathy"
-        output_path = args.output or str(_DATA_OUTPUT_DIR / f"{safe_name}_hillshade_4326.tif")
+        map_name = _get_map_name(args.mask_geojson, mask_key or lake_name) if lake_name else "swissbathy"
+        output_path = args.output or str(_DATA_OUTPUT_DIR / f"{map_name}_hillshade_4326.tif")
         run_pipeline(
             asc_files=asc_files,
             output_path=output_path,

@@ -38,8 +38,7 @@ python src/swissbathy_hillshade.py --lake "zugersee"
 python src/swissbathy_hillshade.py
 
 # With custom hillshade settings
-python src/swissbathy_hillshade.py --lake "zugersee" \
-    --multidirectional --colormap Blues_r --colormap-range 0.0 0.75 --terrain-rgb
+python src/swissbathy_hillshade.py --multidirectional --colormap Blues_r --colormap-range 0.0 0.5 --terrain-rgb
 
 # From pre-downloaded .asc tiles
 python src/swissbathy_hillshade.py --input-dir data/tiles/swissbathy_tiles_zugersee \
