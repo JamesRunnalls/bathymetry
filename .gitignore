@@ -1,6 +1,7 @@
 # ── Data (large files, downloaded/generated) ──────────────────────────────────
 data/*
 !data/.gitkeep
+!data/lakes.geojson
 
 # ── Python ─────────────────────────────────────────────────────────────────────
 __pycache__/

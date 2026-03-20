@@ -834,7 +834,70 @@ def write_terrain_rgb_geotiff(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 7. Legend generation
+# 7. Lake boundary masking
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def apply_lake_mask(output_path: str, geojson_path: str, lake_key: str) -> None:
+    """
+    Set all pixels outside the lake polygon to transparent (alpha=0) in-place.
+
+    Reads the feature whose ``properties.key`` matches *lake_key* from
+    *geojson_path* (expected to be in EPSG:4326, matching the output TIFF),
+    applies a rasterio mask with ``fill=0`` so that outside pixels become
+    fully transparent, then rewrites the file preserving compression, tiling,
+    colour interpretation, and overview levels.
+
+    Parameters
+    ----------
+    output_path : str
+        Path to the 4-band RGBA GeoTIFF to modify in-place.
+    geojson_path : str
+        Path to the GeoJSON FeatureCollection with lake polygons.
+    lake_key : str
+        Value of the ``key`` property identifying the target lake feature.
+    """
+    from rasterio.mask import mask as rio_mask
+
+    if not os.path.isfile(geojson_path):
+        log.warning(f"mask_geojson not found: {geojson_path}; skipping lake boundary mask.")
+        return
+
+    with open(geojson_path) as f:
+        gj = json.load(f)
+
+    features = [
+        feat["geometry"]
+        for feat in gj.get("features", [])
+        if feat.get("properties", {}).get("key") == lake_key
+    ]
+    if not features:
+        log.warning(
+            f"No feature with key='{lake_key}' found in {geojson_path}; "
+            "skipping lake boundary mask."
+        )
+        return
+
+    with rasterio.open(output_path) as src:
+        out_data, _ = rio_mask(src, features, crop=False, filled=True, nodata=0)
+        profile = src.profile.copy()
+
+    with rasterio.open(output_path, "w", **profile) as dst:
+        dst.write(out_data)
+        dst.colorinterp = (
+            rasterio.enums.ColorInterp.red,
+            rasterio.enums.ColorInterp.green,
+            rasterio.enums.ColorInterp.blue,
+            rasterio.enums.ColorInterp.alpha,
+        )
+        dst.build_overviews([2, 4, 8, 16], Resampling.average)
+        dst.update_tags(ns="rio_overview", resampling="average")
+
+    log.info(f"Lake mask applied ({lake_key}): pixels outside polygon are now transparent")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8. Legend generation
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -982,6 +1045,7 @@ def run_pipeline(
     legend: bool = False,
     terrain_rgb: bool = False,
     cache_path: str | None = None,
+    mask_geojson: str | None = None,
 ) -> str:
     """Run the full processing pipeline."""
 
@@ -1027,6 +1091,11 @@ def run_pipeline(
     # Step 5: Write GeoTIFF
     log.info("\n── Step 5: Writing georeferenced TIFF ──")
     write_geotiff(composited, transform, crs, output_path, dst_crs=dst_crs)
+
+    # Step 5b: Optional lake boundary mask
+    if mask_geojson:
+        log.info("\n── Step 5b: Masking pixels outside lake boundary ──")
+        apply_lake_mask(output_path, mask_geojson, lake_name)
 
     # Step 6: Optional legend
     if legend:
@@ -1096,6 +1165,18 @@ Examples:
     )
     parser.add_argument("--dst-crs", type=str, default="EPSG:4326",
                         help="Output CRS (default: EPSG:4326)")
+    _default_lakes_geojson = str(_PROJECT_ROOT / "data" / "lakes.geojson")
+    parser.add_argument(
+        "--mask-geojson", type=str, default=_default_lakes_geojson, metavar="GEOJSON",
+        help=f"GeoJSON file with lake polygons (key property must match lake slug). "
+             f"Pixels outside the matching polygon are set to transparent. "
+             f"(default: {_default_lakes_geojson})",
+    )
+    parser.add_argument(
+        "--mask-lake-key", type=str, default=None, metavar="KEY",
+        help="Key to match in the GeoJSON (default: lake slug). "
+             "Only needed when the GeoJSON key differs from the lake name slug.",
+    )
 
     args = parser.parse_args()
 
@@ -1136,6 +1217,8 @@ Examples:
 
     dst_crs = CRS.from_user_input(args.dst_crs)
 
+    mask_key = args.mask_lake_key  # may be None
+
     def _run_one(lake_slug: str, lake_surface: float):
         log.info(f"=== Processing {lake_slug} (surface {lake_surface} m) ===")
         tile_urls = fetch_tile_urls(lake_name=lake_slug)
@@ -1151,7 +1234,7 @@ Examples:
             output_path=out,
             cache_path=cache_path,
             lake_surface_level=lake_surface,
-            lake_name=lake_slug,
+            lake_name=mask_key or lake_slug,
             azimuth=args.azimuth,
             altitude=args.altitude,
             z_factor=args.z_factor,
@@ -1165,6 +1248,7 @@ Examples:
             dst_crs=dst_crs,
             legend=args.legend,
             terrain_rgb=args.terrain_rgb,
+            mask_geojson=args.mask_geojson,
         )
 
     # Get .asc files
@@ -1177,7 +1261,7 @@ Examples:
             asc_files=asc_files,
             output_path=output_path,
             lake_surface_level=lake_level,
-            lake_name=lake_name,
+            lake_name=mask_key or lake_name,
             azimuth=args.azimuth,
             altitude=args.altitude,
             z_factor=args.z_factor,
@@ -1191,6 +1275,7 @@ Examples:
             dst_crs=dst_crs,
             legend=args.legend,
             terrain_rgb=args.terrain_rgb,
+            mask_geojson=args.mask_geojson,
         )
     elif args.input_dir:
         asc_files = find_asc_files(args.input_dir)
@@ -1203,7 +1288,7 @@ Examples:
             asc_files=asc_files,
             output_path=output_path,
             lake_surface_level=lake_level,
-            lake_name=lake_name,
+            lake_name=mask_key or lake_name,
             azimuth=args.azimuth,
             altitude=args.altitude,
             z_factor=args.z_factor,
@@ -1217,6 +1302,7 @@ Examples:
             dst_crs=dst_crs,
             legend=args.legend,
             terrain_rgb=args.terrain_rgb,
+            mask_geojson=args.mask_geojson,
         )
     elif args.lake:
         _run_one(lake_name, lake_level)
