@@ -15,7 +15,8 @@ bathymetry/
 │   └── example_commands.txt      # Useful one-liners
 ├── data/                         # gitignored — generated/downloaded files
 │   ├── tiles/                    # Raw .asc tiles downloaded from swisstopo STAC
-│   └── output/                   # GeoTIFFs, legend PNGs, XYZ tile directories
+│   ├── output/                   # GeoTIFFs and legend PNGs
+│   └── xyz/                      # XYZ PNG tile directories
 ├── .gitignore
 └── README.md
 ```
@@ -23,8 +24,10 @@ bathymetry/
 ## Requirements
 
 ```bash
-conda install -c conda-forge rasterio numpy requests matplotlib cmocean
+conda install -c conda-forge rasterio numpy requests matplotlib cmocean gdal
 ```
+
+`rclone` must be installed and configured separately if using `--upload`.
 
 ## Usage
 
@@ -53,16 +56,25 @@ Output GeoTIFFs are written to `data/output/`.
 ### 2. Generate XYZ map tiles
 
 ```bash
-# Tile all lakes in data/output/ (default)
-python src/generate_tiles.py --zoom 10-14
+# Tile all GeoTIFFs in a folder
+python src/generate_tiles.py data/output/
 
-# Single lake
-python src/generate_tiles.py \
-    --visual  data/output/zugersee_hillshade_4326.tif \
-    --terrain data/output/zugersee_terrain_rgb_4326.tif \
-    --output-dir data/output/zugersee_tiles \
-    --zoom 10-14
+# Custom zoom range
+python src/generate_tiles.py data/output/ --zoom 7-14
+
+# Generate and upload to an rclone remote
+python src/generate_tiles.py data/output/ --upload cloudflare_r2_personal:rivers
 ```
+
+Each `.tif` in `data/output/` produces a tile directory in `data/xyz/`:
+
+```
+data/output/ageri_hillshade_4326.tif   →  data/xyz/tiles_ageri_hillshade/
+data/output/biel_terrain_rgb_4326.tif  →  data/xyz/tiles_biel_terrain/
+```
+
+Tile generation is skipped if the output directory already exists.
+With `--upload`, each tile set is copied to `REMOTE:BUCKET/tiles_<name>` via `rclone copy` (already-uploaded files are skipped).
 
 ### Terrain-RGB depth decoding
 
