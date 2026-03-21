@@ -84,14 +84,14 @@ TERRAIN_RGB_MAX_VAL = 16_777_215  # 2^24 - 1 (max 3-byte value)
 # Keys match the STAC item ID slugs (swissbathy3d_<slug>).
 # These are used to compute depth = surface_level - elevation.
 LAKE_SURFACE_LEVELS = {
-    #"aegerisee":          724.0,
-   # "baldeggersee":       463.0,
-    #"bielersee":          429.1,
-    #"bodensee":           395.6,
-    #"brienzersee":        563.7,
-   # "hallwilersee":       449.3,
-   # "lacdejoux":         1004.0,
-   # "lacleman":           372.0,
+    "aegerisee":          724.0,
+    "baldeggersee":       463.0,
+    "bielersee":          429.1,
+    "bodensee":           395.6,
+    "brienzersee":        563.7,
+    "hallwilersee":       449.3,
+    "lacdejoux":         1004.0,
+    "lacleman":           372.0,
     "lacneuchatel":       429.4,
     "lagomaggiore":       193.5,
     "murtensee":          429.3,
